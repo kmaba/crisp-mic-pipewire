@@ -209,6 +209,25 @@ room voice) + synthesized music groove. Recorded simultaneously as
 | Ambient (fan/window) removal, total | **26.2 dB** (raw -15.2 → proc -41.4 dBFS; see caveats) |
 | Voice-vs-ambient margin (processed) | ~19 dB |
 
+### Clean rerun (tester silent, steady-state medians)
+
+Re-run with the tester completely quiet (no keyboard/mouse/voice) and
+the browser stream silent, using median 0.5 s frames and excluding the
+first 1.5 s (capture-start transient):
+
+| Metric | Result |
+|---|---|
+| Steady ambient, raw → processed | -26.1 → -45.9 dBFS (**19.8 dB removed**) |
+| Voice alone, processed (median frame) | -21.9 dBFS |
+| Voice margin over steady ambient | **24.1 dB** |
+| Voice over music vs. voice alone | **+0.1 dB** (no measurable muffling) |
+| Music-only cancellation (median frames) | raw -18.0 → proc -56.6 dBFS (**38.6 dB removed**) |
+| Per-band voice retention over music | 80–300 Hz +0.0, 300 Hz–1 kHz +0.5, 1–3 kHz +1.2, 3–8 kHz +1.0, 8–12 kHz +1.0 dB |
+
+A wind gust through the open window around 7 s still shows up in the
+processed ambient range (-51…-28 dBFS) — the fan's steady white noise
+is what's been removed; gusts are physics, not a processing failure.
+
 ### Tone (tin-can fix), voice alone, per band (processed − raw)
 
 | Band | Before (NS moderate, HP on) | After (NS low, HP off)* |
