@@ -228,6 +228,41 @@ A wind gust through the open window around 7 s still shows up in the
 processed ambient range (-51…-28 dBFS) — the fan's steady white noise
 is what's been removed; gusts are physics, not a processing failure.
 
+### Rawish profile (choppy fix + studio tone)
+
+Real music made the previous profile sound "hella choppy": the AEC3
+non-linear suppressor pumps per-band gains every ~10 ms against
+dynamic music, and noise suppression adds watery modulation on top.
+The `webrtc.rawish` profile (default on in the plugin) makes the
+non-linear suppressor nearly transparent and lets the **linear**
+adaptive filter do the cancelling:
+
+- `normal_tuning` masks `6.0/10.0` (was `0.3/0.4` LF, `0.07/0.1` HF),
+  so syllable onsets/pauses aren't clamped before near-end triggers
+- `erle.max_l 2.0 / max_h 1.2` (was `4.0/1.5`) caps suppression depth
+- `ep_strength.default_gain 0.5` halves the echo estimate fed to the
+  suppressor; `echo_audibility` thresholds raised to 20 dB
+- Per-subband near-end exemption on (bands 1–10 and 11–22)
+
+Combined with `webrtc.noise_suppression = false` (the rawest setting;
+the AEC suppressor alone still removes ~16 dB of steady fan):
+
+| Metric | Crisp (NS low, strong suppressor) | Rawish (NS low) | Rawish + NS off (shipped) |
+|---|---|---|---|
+| Music-only cancellation calls | 38.6 dB | 21.7 dB | 17.4 dB |
+| Voice over music vs. alone | +0.1 dB | +0.9 dB | +0.3 dB |
+| Choppiness (frame std, over music − alone) | +0.6 dB (pumping) | -0.3 dB | **-0.4 dB (none)** |
+| Voice tone, 60 Hz–16 kHz | -1.3…-3.7 dB | -1.6…-5.6 dB | **-2.1…+0.0 dB (raw)** |
+| Steady fan removal | 19.8 dB | 22.7 dB | 15.7 dB |
+| Voice margin over fan | 24.1 dB | — | 18.4 dB |
+
+Trade-offs of the shipped rawish setting: music bleed in pauses rises
+to about -40 dBFS (still ~14 dB under voice), and breaths/gusts are
+less suppressed. One-word knobs in `aec.args` to move along the ladder:
+`webrtc.noise_suppression = true` (+ `level = low`) for more
+fan/breath suppression, `webrtc.rawish = false` for maximum
+cancellation (the choppier profile).
+
 ### Tone (tin-can fix), voice alone, per band (processed − raw)
 
 | Band | Before (NS moderate, HP on) | After (NS low, HP off)* |

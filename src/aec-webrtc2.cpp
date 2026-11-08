@@ -199,6 +199,42 @@ static int webrtc_init2(void *object, const struct spa_dict *args,
 		aec_cfg.suppressor.conservative_hf_suppression                 = false;
 	}
 
+	// Rawish profile: minimise non-linear suppressor pumping ("choppy"
+	// with music) and let the linear adaptive filter do the cancelling.
+	// Voice stays raw/transparent; residual echo during double-talk is
+	// traded for natural tone. Silent-period cancellation is preserved
+	// mainly by the linear filter + normal tuning below.
+	bool rawish = webrtc_get_spa_bool(args, "webrtc.rawish", true);
+	if (rawish) {
+		// Gentle suppressor even before nearend triggers (onsets/pauses)
+		aec_cfg.suppressor.normal_tuning.mask_lf.enr_transparent = 6.0f;
+		aec_cfg.suppressor.normal_tuning.mask_lf.enr_suppress    = 10.0f;
+		aec_cfg.suppressor.normal_tuning.mask_hf.enr_transparent = 6.0f;
+		aec_cfg.suppressor.normal_tuning.mask_hf.enr_suppress    = 10.0f;
+		aec_cfg.suppressor.normal_tuning.max_inc_factor          = 8.0f;
+		aec_cfg.suppressor.normal_tuning.max_dec_factor_lf       = 0.5f;
+
+		// Cap residual-echo suppression depth (ERLE) and echo estimate
+		aec_cfg.erle.max_l = 2.0f;
+		aec_cfg.erle.max_h = 1.2f;
+		aec_cfg.ep_strength.default_gain = 0.5f;
+
+		// Only suppress when echo is clearly audible
+		aec_cfg.echo_audibility.audibility_threshold_lf = 20.0f;
+		aec_cfg.echo_audibility.audibility_threshold_mf = 20.0f;
+		aec_cfg.echo_audibility.audibility_threshold_hf = 20.0f;
+
+		// Per-subband nearend exemption: keep bands containing voice
+		aec_cfg.suppressor.use_subband_nearend_detection = true;
+		aec_cfg.suppressor.subband_nearend_detection.subband1.low  = 1;
+		aec_cfg.suppressor.subband_nearend_detection.subband1.high = 10;
+		aec_cfg.suppressor.subband_nearend_detection.subband2.low  = 11;
+		aec_cfg.suppressor.subband_nearend_detection.subband2.high = 22;
+		aec_cfg.suppressor.subband_nearend_detection.nearend_threshold = 0.5f;
+		aec_cfg.suppressor.subband_nearend_detection.snr_threshold     = 0.5f;
+		spa_log_info(impl->log, "Rawish AEC3 profile enabled");
+	}
+
 	webrtc_get_spa_float(impl, args, "webrtc.nearend_hf_transparent",
 			&aec_cfg.suppressor.nearend_tuning.mask_hf.enr_transparent);
 	webrtc_get_spa_float(impl, args, "webrtc.nearend_hf_suppress",
