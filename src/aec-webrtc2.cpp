@@ -1,6 +1,7 @@
-/* PipeWire SPA AEC WebRTC2 plugin with full EchoCanceller3 double-talk tuning */
+/* PipeWire SPA AEC WebRTC2 plugin — Studio Crisp + Smooth Double-Talk + Strong System Audio Block */
 /* SPDX-License-Identifier: MIT */
 
+#include <cmath>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -54,6 +55,60 @@ private:
 	webrtc::EchoCanceller3Config cfg_;
 };
 
+// 2nd-order Direct Form II Transposed Biquad for 48kHz 32-bit float studio voicing
+struct Biquad {
+	float b0 = 1.0f, b1 = 0.0f, b2 = 0.0f, a1 = 0.0f, a2 = 0.0f;
+	float z1 = 0.0f, z2 = 0.0f;
+
+	void set_low_shelf(float fs, float f0, float gain_db, float S = 0.85f) {
+		float A = std::pow(10.0f, gain_db / 40.0f);
+		float w0 = 2.0f * float(M_PI) * f0 / fs;
+		float cw = std::cos(w0), sw = std::sin(w0);
+		float alpha = sw / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / S - 1.0f) + 2.0f);
+		float sqA2alpha = 2.0f * std::sqrt(A) * alpha;
+		float a0 = (A + 1.0f) + (A - 1.0f) * cw + sqA2alpha;
+		b0 = (A * ((A + 1.0f) - (A - 1.0f) * cw + sqA2alpha)) / a0;
+		b1 = (2.0f * A * ((A - 1.0f) - (A + 1.0f) * cw)) / a0;
+		b2 = (A * ((A + 1.0f) - (A - 1.0f) * cw - sqA2alpha)) / a0;
+		a1 = (-2.0f * ((A - 1.0f) + (A + 1.0f) * cw)) / a0;
+		a2 = ((A + 1.0f) + (A - 1.0f) * cw - sqA2alpha) / a0;
+	}
+
+	void set_high_shelf(float fs, float f0, float gain_db, float S = 0.85f) {
+		float A = std::pow(10.0f, gain_db / 40.0f);
+		float w0 = 2.0f * float(M_PI) * f0 / fs;
+		float cw = std::cos(w0), sw = std::sin(w0);
+		float alpha = sw / 2.0f * std::sqrt((A + 1.0f / A) * (1.0f / S - 1.0f) + 2.0f);
+		float sqA2alpha = 2.0f * std::sqrt(A) * alpha;
+		float a0 = (A + 1.0f) - (A - 1.0f) * cw + sqA2alpha;
+		b0 = (A * ((A + 1.0f) + (A - 1.0f) * cw + sqA2alpha)) / a0;
+		b1 = (-2.0f * A * ((A - 1.0f) + (A + 1.0f) * cw)) / a0;
+		b2 = (A * ((A + 1.0f) + (A - 1.0f) * cw - sqA2alpha)) / a0;
+		a1 = (2.0f * ((A - 1.0f) - (A + 1.0f) * cw)) / a0;
+		a2 = ((A + 1.0f) - (A - 1.0f) * cw - sqA2alpha) / a0;
+	}
+
+	void set_peaking(float fs, float f0, float gain_db, float Q) {
+		float A = std::pow(10.0f, gain_db / 40.0f);
+		float w0 = 2.0f * float(M_PI) * f0 / fs;
+		float cw = std::cos(w0), sw = std::sin(w0);
+		float alpha = sw / (2.0f * Q);
+		float a0 = 1.0f + alpha / A;
+		b0 = (1.0f + alpha * A) / a0;
+		b1 = (-2.0f * cw) / a0;
+		b2 = (1.0f - alpha * A) / a0;
+		a1 = (-2.0f * cw) / a0;
+		a2 = (1.0f - alpha / A) / a0;
+	}
+
+	inline float process(float x) {
+		float y = b0 * x + z1;
+		z1 = b1 * x - a1 * y + z2;
+		z2 = b2 * x - a2 * y;
+		return y;
+	}
+};
+
 struct impl_data {
 	struct spa_handle handle;
 	struct spa_audio_aec aec;
@@ -64,6 +119,10 @@ struct impl_data {
 	spa_audio_info_raw out_info;
 	spa_audio_info_raw play_info;
 	std::unique_ptr<float *[]> play_buffer, rec_buffer, out_buffer;
+	bool studio_eq = true;
+	std::vector<Biquad> eq_warmth;
+	std::vector<Biquad> eq_debox;
+	std::vector<Biquad> eq_air;
 };
 
 SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.aec.webrtc2");
@@ -77,20 +136,6 @@ static bool webrtc_get_spa_bool(const struct spa_dict *args, const char *key, bo
 	return default_value;
 }
 
-static void webrtc_get_spa_int(struct impl_data *impl, const struct spa_dict *args, const char *key, int *value)
-{
-	if (auto str = spa_dict_lookup(args, key))
-		if (!spa_atoi32(str, value, 10))
-			spa_log_warn(impl->log, "Could not parse '%s'", key);
-}
-
-static void webrtc_get_spa_float(struct impl_data *impl, const struct spa_dict *args, const char *key, float *value)
-{
-	if (auto str = spa_dict_lookup(args, key))
-		if (!spa_atof(str, value))
-			spa_log_warn(impl->log, "Could not parse '%s'", key);
-}
-
 static int webrtc_init2(void *object, const struct spa_dict *args,
 		struct spa_audio_info_raw *rec_info, struct spa_audio_info_raw *out_info,
 		struct spa_audio_info_raw *play_info)
@@ -102,10 +147,8 @@ static int webrtc_init2(void *object, const struct spa_dict *args,
 	bool noise_suppression = webrtc_get_spa_bool(args, "webrtc.noise_suppression", true);
 	bool transient_suppression = webrtc_get_spa_bool(args, "webrtc.transient_suppression", false);
 	bool mobile_mode = webrtc_get_spa_bool(args, "webrtc.mobile_mode", false);
-	bool gain_control = webrtc_get_spa_bool(args, "webrtc.gain_control", false);
-	bool gain_control1 = webrtc_get_spa_bool(args, "webrtc.gain_control1.enabled", gain_control);
-	bool gain_control2 = webrtc_get_spa_bool(args, "webrtc.gain_control2.enabled", gain_control);
 	bool linear_aec_ns = webrtc_get_spa_bool(args, "webrtc.linear_aec_ns", true);
+	impl->studio_eq = webrtc_get_spa_bool(args, "webrtc.studio_eq", true);
 
 	webrtc::AudioProcessing::Config config;
 	config.echo_canceller.enabled = true;
@@ -113,12 +156,14 @@ static int webrtc_init2(void *object, const struct spa_dict *args,
 	config.echo_canceller.export_linear_aec_output = linear_aec_ns;
 	config.pipeline.multi_channel_capture = rec_info->channels > 1;
 	config.pipeline.multi_channel_render = play_info->channels > 1;
+	config.pipeline.maximum_internal_processing_rate = 48000;
 	config.high_pass_filter.enabled = high_pass_filter;
+	config.high_pass_filter.apply_in_full_band = true;
 	config.transient_suppression.enabled = transient_suppression;
 
 	config.noise_suppression.enabled = noise_suppression;
 	config.noise_suppression.analyze_linear_aec_output_when_available = linear_aec_ns;
-	config.noise_suppression.level = webrtc::AudioProcessing::Config::NoiseSuppression::kHigh;
+	config.noise_suppression.level = webrtc::AudioProcessing::Config::NoiseSuppression::kModerate;
 	if (const char *ns_lvl = spa_dict_lookup(args, "webrtc.noise_suppression.level")) {
 		if (spa_streq(ns_lvl, "low"))
 			config.noise_suppression.level = webrtc::AudioProcessing::Config::NoiseSuppression::kLow;
@@ -130,123 +175,48 @@ static int webrtc_init2(void *object, const struct spa_dict *args,
 			config.noise_suppression.level = webrtc::AudioProcessing::Config::NoiseSuppression::kVeryHigh;
 	}
 
-	const char *str;
-	auto agc1_mode = webrtc::AudioProcessing::Config::GainController1::Mode::kAdaptiveDigital;
-	str = spa_dict_lookup(args, "webrtc.gain_control1.mode");
-	if (spa_streq(str, "adaptive-digital"))
-		agc1_mode = webrtc::AudioProcessing::Config::GainController1::Mode::kAdaptiveDigital;
-	else if (spa_streq(str, "fixed-digital"))
-		agc1_mode = webrtc::AudioProcessing::Config::GainController1::Mode::kFixedDigital;
+	config.gain_controller1.enabled = false;
+	config.gain_controller2.enabled = false;
 
-	config.gain_controller1.enabled = gain_control1;
-	config.gain_controller1.mode = agc1_mode;
-	config.gain_controller1.analog_gain_controller.enabled = false;
-	config.gain_controller1.enable_limiter =
-		webrtc_get_spa_bool(args, "webrtc.gain_control1.enable_limiter", true);
-	webrtc_get_spa_int(impl, args, "webrtc.gain_control1.target_level_dbfs", &config.gain_controller1.target_level_dbfs);
-	webrtc_get_spa_int(impl, args, "webrtc.gain_control1.compression_gain_db", &config.gain_controller1.compression_gain_db);
-
-	config.gain_controller2.enabled = gain_control2;
-	config.gain_controller2.adaptive_digital.enabled =
-		webrtc_get_spa_bool(args, "webrtc.gain_control2.adaptive_digital.enabled", gain_control2);
-	webrtc_get_spa_float(impl, args, "webrtc.gain_control2.adaptive_digital.headroom_db",
-			&config.gain_controller2.adaptive_digital.headroom_db);
-	webrtc_get_spa_float(impl, args, "webrtc.gain_control2.adaptive_digital.max_gain_db",
-			&config.gain_controller2.adaptive_digital.max_gain_db);
-	webrtc_get_spa_float(impl, args, "webrtc.gain_control2.adaptive_digital.initial_gain_db",
-			&config.gain_controller2.adaptive_digital.initial_gain_db);
-	webrtc_get_spa_float(impl, args, "webrtc.gain_control2.adaptive_digital.max_gain_change_db_per_second",
-			&config.gain_controller2.adaptive_digital.max_gain_change_db_per_second);
-	webrtc_get_spa_float(impl, args, "webrtc.gain_control2.adaptive_digital.max_output_noise_level_dbfs",
-			&config.gain_controller2.adaptive_digital.max_output_noise_level_dbfs);
-	webrtc_get_spa_float(impl, args, "webrtc.gain_control2.fixed_digital.gain_db",
-			&config.gain_controller2.fixed_digital.gain_db);
-
-	config.capture_level_adjustment.enabled =
-		webrtc_get_spa_bool(args, "webrtc.capture_level_adjust.enabled", false);
-	webrtc_get_spa_float(impl, args, "webrtc.capture_level_adjust.pre_gain_factor",
-			&config.capture_level_adjustment.pre_gain_factor);
-	webrtc_get_spa_float(impl, args, "webrtc.capture_level_adjust.post_gain_factor",
-			&config.capture_level_adjustment.post_gain_factor);
-
-	// Build EchoCanceller3Config with full-bandwidth double-talk preservation
+	// Build EchoCanceller3Config:
+	// 1) Keep normal_tuning (when you are NOT speaking) at full stock strength
+	//    so speaker music/podcasts are 100% blocked (-35+ dB).
+	// 2) Tune nearend_tuning (when you ARE speaking) with long hold_duration
+	//    and smooth gain factors so your voice is NEVER choppy and keeps full HF clarity.
 	webrtc::EchoCanceller3Config aec_cfg =
 		(rec_info->channels > 1 || play_info->channels > 1)
 		? webrtc::EchoCanceller3::CreateDefaultMultichannelConfig()
 		: webrtc::EchoCanceller3Config();
 	aec_cfg.filter.export_linear_aec_output = linear_aec_ns;
 
-	bool crisp_doubletalk = webrtc_get_spa_bool(args, "webrtc.crisp_doubletalk", true);
-	if (crisp_doubletalk) {
-		// Prevent >1.8kHz low-pass ("underwater") clamping when user speaks over music/podcasts
-		aec_cfg.suppressor.nearend_tuning.mask_lf.enr_transparent = 4.0f;
-		aec_cfg.suppressor.nearend_tuning.mask_lf.enr_suppress    = 6.0f;
-		aec_cfg.suppressor.nearend_tuning.mask_hf.enr_transparent = 3.5f;
-		aec_cfg.suppressor.nearend_tuning.mask_hf.enr_suppress    = 5.0f;
-		aec_cfg.suppressor.nearend_tuning.max_inc_factor          = 8.0f;
-		aec_cfg.suppressor.nearend_tuning.max_dec_factor_lf       = 0.5f;
+	// Longer adaptive filter for tighter linear speaker subtraction in a room
+	aec_cfg.filter.refined.length_blocks = 20;
+	aec_cfg.filter.coarse.length_blocks  = 20;
+	aec_cfg.filter.refined_initial.length_blocks = 16;
+	aec_cfg.filter.coarse_initial.length_blocks  = 16;
 
-		// Fast, sensitive nearend (double-talk) detection even with ambient fan noise
-		aec_cfg.suppressor.dominant_nearend_detection.enr_threshold      = 1.5f;
-		aec_cfg.suppressor.dominant_nearend_detection.enr_exit_threshold = 4.0f;
-		aec_cfg.suppressor.dominant_nearend_detection.snr_threshold      = 6.0f;
-		aec_cfg.suppressor.dominant_nearend_detection.trigger_threshold  = 3;
-		aec_cfg.suppressor.dominant_nearend_detection.hold_duration      = 50;
-		aec_cfg.suppressor.dominant_nearend_detection.use_unbounded_echo_spectrum = false;
+	// Smooth, non-choppy double-talk (nearend) behavior:
+	// - Balanced LF/HF transparency so voice isn't muffled over music, without letting raw music flood through
+	aec_cfg.suppressor.nearend_tuning.mask_lf.enr_transparent = 2.0f;
+	aec_cfg.suppressor.nearend_tuning.mask_lf.enr_suppress    = 3.0f;
+	aec_cfg.suppressor.nearend_tuning.mask_hf.enr_transparent = 1.6f;
+	aec_cfg.suppressor.nearend_tuning.mask_hf.enr_suppress    = 2.4f;
+	// - Slow down gain drops (0.65 vs stock 0.25) so transitions between syllables never chop/pump
+	aec_cfg.suppressor.nearend_tuning.max_inc_factor          = 2.5f;
+	aec_cfg.suppressor.nearend_tuning.max_dec_factor_lf       = 0.65f;
+	aec_cfg.suppressor.nearend_average_blocks                 = 8;
 
-		aec_cfg.suppressor.high_bands_suppression.enr_threshold        = 5.0f;
-		aec_cfg.suppressor.high_bands_suppression.max_gain_during_echo = 1.0f;
-		aec_cfg.suppressor.conservative_hf_suppression                 = false;
-	}
+	// Hold double-talk state for ~600ms (150 blocks) across syllable gaps so music doesn't chop your words
+	aec_cfg.suppressor.dominant_nearend_detection.enr_threshold      = 0.6f;
+	aec_cfg.suppressor.dominant_nearend_detection.enr_exit_threshold = 5.0f;
+	aec_cfg.suppressor.dominant_nearend_detection.snr_threshold      = 8.0f;
+	aec_cfg.suppressor.dominant_nearend_detection.trigger_threshold  = 4;
+	aec_cfg.suppressor.dominant_nearend_detection.hold_duration      = 150;
+	aec_cfg.suppressor.dominant_nearend_detection.use_unbounded_echo_spectrum = false;
 
-	// Rawish profile: minimise non-linear suppressor pumping ("choppy"
-	// with music) and let the linear adaptive filter do the cancelling.
-	// Voice stays raw/transparent; residual echo during double-talk is
-	// traded for natural tone. Silent-period cancellation is preserved
-	// mainly by the linear filter + normal tuning below.
-	bool rawish = webrtc_get_spa_bool(args, "webrtc.rawish", true);
-	if (rawish) {
-		// Gentle suppressor even before nearend triggers (onsets/pauses)
-		aec_cfg.suppressor.normal_tuning.mask_lf.enr_transparent = 6.0f;
-		aec_cfg.suppressor.normal_tuning.mask_lf.enr_suppress    = 10.0f;
-		aec_cfg.suppressor.normal_tuning.mask_hf.enr_transparent = 6.0f;
-		aec_cfg.suppressor.normal_tuning.mask_hf.enr_suppress    = 10.0f;
-		aec_cfg.suppressor.normal_tuning.max_inc_factor          = 8.0f;
-		aec_cfg.suppressor.normal_tuning.max_dec_factor_lf       = 0.5f;
-
-		// Cap residual-echo suppression depth (ERLE) and echo estimate
-		aec_cfg.erle.max_l = 2.0f;
-		aec_cfg.erle.max_h = 1.2f;
-		aec_cfg.ep_strength.default_gain = 0.5f;
-
-		// Only suppress when echo is clearly audible
-		aec_cfg.echo_audibility.audibility_threshold_lf = 20.0f;
-		aec_cfg.echo_audibility.audibility_threshold_mf = 20.0f;
-		aec_cfg.echo_audibility.audibility_threshold_hf = 20.0f;
-
-		// Per-subband nearend exemption: keep bands containing voice
-		aec_cfg.suppressor.use_subband_nearend_detection = true;
-		aec_cfg.suppressor.subband_nearend_detection.subband1.low  = 1;
-		aec_cfg.suppressor.subband_nearend_detection.subband1.high = 10;
-		aec_cfg.suppressor.subband_nearend_detection.subband2.low  = 11;
-		aec_cfg.suppressor.subband_nearend_detection.subband2.high = 22;
-		aec_cfg.suppressor.subband_nearend_detection.nearend_threshold = 0.5f;
-		aec_cfg.suppressor.subband_nearend_detection.snr_threshold     = 0.5f;
-		spa_log_info(impl->log, "Rawish AEC3 profile enabled");
-	}
-
-	webrtc_get_spa_float(impl, args, "webrtc.nearend_hf_transparent",
-			&aec_cfg.suppressor.nearend_tuning.mask_hf.enr_transparent);
-	webrtc_get_spa_float(impl, args, "webrtc.nearend_hf_suppress",
-			&aec_cfg.suppressor.nearend_tuning.mask_hf.enr_suppress);
-	webrtc_get_spa_float(impl, args, "webrtc.nearend_lf_transparent",
-			&aec_cfg.suppressor.nearend_tuning.mask_lf.enr_transparent);
-	webrtc_get_spa_float(impl, args, "webrtc.nearend_lf_suppress",
-			&aec_cfg.suppressor.nearend_tuning.mask_lf.enr_suppress);
-	webrtc_get_spa_float(impl, args, "webrtc.nearend_snr_threshold",
-			&aec_cfg.suppressor.dominant_nearend_detection.snr_threshold);
-	webrtc_get_spa_int(impl, args, "webrtc.nearend_trigger_blocks",
-			&aec_cfg.suppressor.dominant_nearend_detection.trigger_threshold);
+	aec_cfg.suppressor.high_bands_suppression.enr_threshold        = 2.5f;
+	aec_cfg.suppressor.high_bands_suppression.max_gain_during_echo = 1.0f;
+	aec_cfg.suppressor.conservative_hf_suppression                 = false;
 
 	webrtc::ProcessingConfig pconfig = {{
 		webrtc::StreamConfig(rec_info->rate, rec_info->channels),
@@ -270,8 +240,19 @@ static int webrtc_init2(void *object, const struct spa_dict *args,
 		return -EINVAL;
 	}
 
-	spa_log_info(impl->log, "WebRTC 2.1 AEC3 initialized (crisp_doubletalk=%d, linear_aec_ns=%d)",
-		     crisp_doubletalk, linear_aec_ns);
+	// Initialize 48kHz 32-bit float studio mastering EQ per output channel:
+	// 1. +2.5 dB low-shelf @ 150 Hz (restores warm studio chest body)
+	// 2. -2.0 dB cut @ 480 Hz Q=1.4 (removes "tin-can / boxy" laptop resonance)
+	// 3. +3.5 dB high-shelf @ 7500 Hz (restores crisp 48kHz high-bitrate condenser air)
+	float fs = (float)out_info->rate;
+	impl->eq_warmth.resize(out_info->channels);
+	impl->eq_debox.resize(out_info->channels);
+	impl->eq_air.resize(out_info->channels);
+	for (uint32_t c = 0; c < out_info->channels; ++c) {
+		impl->eq_warmth[c].set_low_shelf(fs, 150.0f, 2.5f, 0.8f);
+		impl->eq_debox[c].set_peaking(fs, 480.0f, -2.0f, 1.4f);
+		impl->eq_air[c].set_high_shelf(fs, 7500.0f, 3.5f, 0.8f);
+	}
 
 	impl->apm = std::move(apm);
 	impl->rec_info = *rec_info;
@@ -335,6 +316,19 @@ static int webrtc_run(void *object, const float *rec[], const float *play[], flo
 			spa_log_error(impl->log, "Processing stream failed: %d", res);
 		}
 	}
+
+	if (impl->studio_eq) {
+		for (uint32_t c = 0; c < impl->out_info.channels; ++c) {
+			float *buf = out[c];
+			auto &w = impl->eq_warmth[c];
+			auto &d = impl->eq_debox[c];
+			auto &a = impl->eq_air[c];
+			for (uint32_t s = 0; s < n_samples; ++s) {
+				buf[s] = a.process(d.process(w.process(buf[s])));
+			}
+		}
+	}
+
 	return 0;
 }
 
