@@ -1,0 +1,12 @@
+[Unit]
+Description=Keep Buds 4 Pro awake with inaudible tone
+After=pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+ExecStart=/home/kmaba/.local/bin/buds-keepalive.sh
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
