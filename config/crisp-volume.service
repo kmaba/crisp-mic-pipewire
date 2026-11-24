@@ -5,7 +5,7 @@ Wants=pipewire-pulse.service
 
 [Service]
 Type=simple
-ExecStart=/bin/sh -c 'while true; do /usr/bin/pactl set-sink-volume pebble_out 100%% 2>/dev/null; /usr/bin/pactl set-sink-volume alsa_output.pci-0000_06_00.6.analog-stereo 100%% 2>/dev/null; /usr/bin/pactl set-source-volume mic_crisp 4dB 2>/dev/null; sleep 5; done'
+ExecStart=/bin/sh -c 'while true; do /usr/bin/pactl set-sink-volume pebble_out 100%% 2>/dev/null; /usr/bin/pactl set-sink-volume alsa_output.pci-0000_06_00.6.analog-stereo 100%% 2>/dev/null; /usr/bin/pactl set-source-volume mic_crisp 2.5dB 2>/dev/null; sleep 2; done'
 Restart=always
 RestartSec=3
 
