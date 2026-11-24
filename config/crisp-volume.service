@@ -1,13 +1,13 @@
 [Unit]
-Description=Assert Crisp Mic output volumes (Pebbles analog jack 100%%)
+Description=Assert Crisp Mic output volumes (Pebbles analog jack 100%%, mic +8dB)
 After=pipewire-pulse.service wireplumber.service
 Wants=pipewire-pulse.service
-PartOf=pipewire-pulse.service
 
 [Service]
-Type=oneshot
-ExecStart=/bin/sh -c 'sleep 1.5; /usr/bin/pactl set-sink-volume pebble_out 100%%; /usr/bin/pactl set-sink-volume alsa_output.pci-0000_06_00.6.analog-stereo 100%%; /usr/bin/pactl set-source-volume mic_crisp 8dB'
-RemainAfterExit=yes
+Type=simple
+ExecStart=/bin/sh -c 'while true; do /usr/bin/pactl set-sink-volume pebble_out 100%% 2>/dev/null; /usr/bin/pactl set-sink-volume alsa_output.pci-0000_06_00.6.analog-stereo 100%% 2>/dev/null; /usr/bin/pactl set-source-volume mic_crisp 8dB 2>/dev/null; sleep 5; done'
+Restart=always
+RestartSec=3
 
 [Install]
 WantedBy=default.target
